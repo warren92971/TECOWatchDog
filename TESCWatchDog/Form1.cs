@@ -9,22 +9,23 @@ namespace TESCWatchDog;
 public partial class Form1 : Form
 {
     private readonly IMqttClient mqttClient;
-    private readonly System.Windows.Forms.Timer watchdogTimer;
-    private DateTimeOffset? lastMessageReceivedAt;
-    private bool timeoutAlertSent;
-    private bool timeoutAlertPublishing;
+    private readonly object dailyLogLock = new();
+    private readonly string dailyLogDirectory = Path.Combine(AppContext.BaseDirectory, "Log");
+    private StreamWriter? dailyLogWriter;
+    private DateOnly dailyLogDate;
+    private bool dailyLogFailureReported;
 
     public Form1()
     {
         InitializeComponent();
+        InitializeDailyLog();
+        InitializeDatabaseSettings();
 
         mqttClient = new MqttFactory().CreateMqttClient();
         mqttClient.ApplicationMessageReceivedAsync += OnMessageReceivedAsync;
         mqttClient.ConnectedAsync += OnConnectedAsync;
         mqttClient.DisconnectedAsync += OnDisconnectedAsync;
 
-        watchdogTimer = new System.Windows.Forms.Timer { Interval = 1000 };
-        watchdogTimer.Tick += watchdogTimer_Tick;
     }
 
     private async void connectButton_Click(object sender, EventArgs e)
@@ -36,10 +37,9 @@ public partial class Form1 : Form
             return;
         }
 
-        if (string.IsNullOrWhiteSpace(hostTextBox.Text) ||
-            string.IsNullOrWhiteSpace(topicTextBox.Text))
+        if (string.IsNullOrWhiteSpace(hostTextBox.Text))
         {
-            MessageBox.Show("Broker 與 Topic 不可空白。", "設定錯誤",
+            MessageBox.Show("Broker 不可空白。", "設定錯誤",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
@@ -56,36 +56,29 @@ public partial class Form1 : Form
                 .WithCleanSession()
                 .WithKeepAlivePeriod(TimeSpan.FromSeconds(30));
 
-            if (!string.IsNullOrWhiteSpace(usernameTextBox.Text))
-            {
-                optionsBuilder.WithCredentials(usernameTextBox.Text, passwordTextBox.Text);
-            }
-
-            if (tlsCheckBox.Checked)
-            {
-                optionsBuilder.WithTlsOptions(options => options.UseTls());
-            }
-
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
             await mqttClient.ConnectAsync(optionsBuilder.Build(), timeout.Token);
-            await mqttClient.SubscribeAsync(
+            if (!string.IsNullOrWhiteSpace(topicTextBox.Text))
+            {
+            var subscription = await mqttClient.SubscribeAsync(
                 new MqttTopicFilterBuilder()
                     .WithTopic(topicTextBox.Text.Trim())
                     .WithAtLeastOnceQoS()
                     .Build(),
                 timeout.Token);
-
-            lastMessageReceivedAt = DateTimeOffset.Now;
-            timeoutAlertSent = false;
-            watchdogTimer.Start();
+            if (subscription.Items.Any(item => (int)item.ResultCode >= 128))
+                throw new InvalidOperationException("Broker 拒絕訂閱 Topic。");
+            }
         }
         catch (Exception ex)
         {
             AppendLog($"連線失敗：{ex.Message}");
-            if (mqttClient.IsConnected)
+            try
             {
-                await mqttClient.DisconnectAsync();
+                if (mqttClient.IsConnected) await mqttClient.DisconnectAsync();
             }
+            catch (Exception disconnectError) { AppendLog($"清理 MQTT 連線失敗：{disconnectError.Message}"); }
+            if (IsDisposed || Disposing) return;
             SetDisconnectedState();
         }
     }
@@ -105,7 +98,7 @@ public partial class Form1 : Form
         }
         finally
         {
-            SetDisconnectedState();
+            if (!IsDisposed && !Disposing) SetDisconnectedState();
         }
     }
 
@@ -152,7 +145,9 @@ public partial class Form1 : Form
                 .WithRetainFlag(retainCheckBox.Checked)
                 .Build();
 
-            await mqttClient.PublishAsync(message);
+            using var publishTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            var result = await PublishWithReceiptAsync(message, publishTimeout.Token);
+            if ((int)result.ReasonCode >= 128) throw new InvalidOperationException($"Broker 拒絕發布：{result.ReasonCode}");
             AppendLog($"已發布 [{topic}] QoS {(int)qos}, {Encoding.UTF8.GetByteCount(payload)} bytes");
         }
         catch (Exception ex)
@@ -161,69 +156,21 @@ public partial class Form1 : Form
         }
         finally
         {
-            publishButton.Enabled = mqttClient.IsConnected;
-        }
-    }
-
-    private async void watchdogTimer_Tick(object? sender, EventArgs e)
-    {
-        if (!autoAlertCheckBox.Checked || !mqttClient.IsConnected ||
-            lastMessageReceivedAt is null || timeoutAlertSent || timeoutAlertPublishing)
-        {
-            return;
-        }
-
-        var elapsed = DateTimeOffset.Now - lastMessageReceivedAt.Value;
-        if (elapsed.TotalSeconds < (double)timeoutSecondsNumeric.Value)
-        {
-            return;
-        }
-
-        timeoutAlertPublishing = true;
-        try
-        {
-            var topic = alertTopicTextBox.Text.Trim();
-            if (string.IsNullOrWhiteSpace(topic) || topic.Contains('+') || topic.Contains('#'))
-            {
-                AppendLog("逾時警報未發布：警報 Topic 不可空白或包含萬用字元。");
-                timeoutAlertSent = true;
-                return;
-            }
-
-            var payload = alertPayloadTextBox.Text
-                .Replace("{timestamp}", DateTimeOffset.Now.ToString("O"), StringComparison.Ordinal)
-                .Replace("{seconds}", ((int)elapsed.TotalSeconds).ToString(), StringComparison.Ordinal)
-                .Replace("{lastReceived}", lastMessageReceivedAt.Value.ToString("O"), StringComparison.Ordinal);
-
-            var message = new MqttApplicationMessageBuilder()
-                .WithTopic(topic)
-                .WithPayload(payload)
-                .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
-                .Build();
-
-            await mqttClient.PublishAsync(message);
-            timeoutAlertSent = true;
-            AppendLog($"已自動發布無資料警報 [{topic}]，已 {elapsed.TotalSeconds:F0} 秒未收到資料。");
-        }
-        catch (Exception ex)
-        {
-            AppendLog($"自動發布警報失敗：{ex.Message}");
-        }
-        finally
-        {
-            timeoutAlertPublishing = false;
+            if (!IsDisposed && !Disposing) publishButton.Enabled = mqttClient.IsConnected;
         }
     }
 
     private Task OnConnectedAsync(MqttClientConnectedEventArgs args)
     {
-        BeginInvoke(() =>
+        PostUi(() =>
         {
             statusLabel.Text = "已連線";
             statusLabel.ForeColor = Color.ForestGreen;
             connectButton.Enabled = false;
             disconnectButton.Enabled = true;
             publishButton.Enabled = true;
+            pushAlertButton.Enabled = true;
+            pushRecoveryButton.Enabled = true;
             AppendLog($"已連線至 {hostTextBox.Text}:{portTextBox.Text}");
         });
         return Task.CompletedTask;
@@ -231,7 +178,8 @@ public partial class Form1 : Form
 
     private Task OnDisconnectedAsync(MqttClientDisconnectedEventArgs args)
     {
-        BeginInvoke(() =>
+        DisconnectReceipts();
+        PostUi(() =>
         {
             SetDisconnectedState();
             AppendLog(args.ClientWasConnected
@@ -243,21 +191,21 @@ public partial class Form1 : Form
 
     private Task OnMessageReceivedAsync(MqttApplicationMessageReceivedEventArgs args)
     {
+        MatchReceipt(args.ApplicationMessage);
         var payload = args.ApplicationMessage.PayloadSegment.Count == 0
             ? string.Empty
             : Encoding.UTF8.GetString(args.ApplicationMessage.PayloadSegment);
 
-        BeginInvoke(() =>
+        PostUi(() =>
         {
-            lastMessageReceivedAt = DateTimeOffset.Now;
-            timeoutAlertSent = false;
-            AppendLog($"[{args.ApplicationMessage.Topic}] {payload}");
+            AppendLog($"MQTT 接收 [{args.ApplicationMessage.Topic}]；內容：{payload}");
         });
         return Task.CompletedTask;
     }
 
     private void SetConnectingState()
     {
+        hostTextBox.Enabled = portTextBox.Enabled = false;
         statusLabel.Text = "連線中...";
         statusLabel.ForeColor = Color.DarkOrange;
         connectButton.Enabled = false;
@@ -267,25 +215,84 @@ public partial class Form1 : Form
 
     private void SetDisconnectedState()
     {
-        watchdogTimer.Stop();
-        lastMessageReceivedAt = null;
-        timeoutAlertSent = false;
+        hostTextBox.Enabled = portTextBox.Enabled = true;
         statusLabel.Text = "未連線";
         statusLabel.ForeColor = Color.Firebrick;
         connectButton.Enabled = true;
         disconnectButton.Enabled = false;
         publishButton.Enabled = false;
+        pushAlertButton.Enabled = false;
+        pushRecoveryButton.Enabled = false;
     }
 
     private void AppendLog(string message)
     {
-        logTextBox.AppendText($"{DateTime.Now:yyyy-MM-dd HH:mm:ss}  {message}{Environment.NewLine}");
+        if (IsDisposed || Disposing) return;
+        if (logTextBox.TextLength > 150000) logTextBox.Clear();
+        var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}  {message}{Environment.NewLine}";
+        logTextBox.AppendText(line);
+        WriteDailyLog(line);
+    }
+
+    private void InitializeDailyLog()
+    {
+        try
+        {
+            Directory.CreateDirectory(dailyLogDirectory);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            dailyLogFailureReported = true;
+            logTextBox.AppendText($"{DateTime.Now:yyyy-MM-dd HH:mm:ss}  無法建立每日 Log 資料夾：{ex.Message}{Environment.NewLine}");
+        }
+    }
+
+    private void WriteDailyLog(string line)
+    {
+        if (dailyLogFailureReported) return;
+        try
+        {
+            lock (dailyLogLock)
+            {
+                var today = DateOnly.FromDateTime(DateTime.Now);
+                if (dailyLogWriter == null || dailyLogDate != today)
+                {
+                    dailyLogWriter?.Dispose();
+                    dailyLogDate = today;
+                    var path = Path.Combine(dailyLogDirectory, $"{today:yyyy-MM-dd}.txt");
+                    var stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read);
+                    dailyLogWriter = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true };
+                }
+                dailyLogWriter.Write(line);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            dailyLogFailureReported = true;
+            logTextBox.AppendText($"{DateTime.Now:yyyy-MM-dd HH:mm:ss}  每日 Log 寫入失敗：{ex.Message}{Environment.NewLine}");
+        }
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
-        watchdogTimer.Dispose();
+        // 先取消非同步工作，再釋放 MQTT；晚到的 UI 回呼由 PostUi 忽略。
+        monitorCancellation?.Cancel();
+        receiptLifetime.Cancel();
+        DisconnectReceipts();
+        lock (dailyLogLock)
+        {
+            dailyLogWriter?.Dispose();
+            dailyLogWriter = null;
+        }
         mqttClient.Dispose();
         base.OnFormClosed(e);
+    }
+
+    private void PostUi(Action action)
+    {
+        // MQTTnet 回呼可能在背景執行緒，所有控制項操作都切回 UI 執行緒。
+        if (!IsHandleCreated || IsDisposed || Disposing) return;
+        try { BeginInvoke(() => { if (!IsDisposed && !Disposing) action(); }); }
+        catch (InvalidOperationException) { }
     }
 }

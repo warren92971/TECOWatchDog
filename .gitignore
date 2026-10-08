@@ -6,3 +6,7 @@
 
 # Local temporary files
 tmp/
+system.ini
+**/Log/*.log
+**/Log/*.txt
+TESCWatchDog/Form1.Database.resx

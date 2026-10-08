@@ -6,10 +6,23 @@
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
+    <Version>1.0.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Update="Form1.cs"><SubType>Form</SubType></Compile>
+    <Compile Update="Form1.Database.cs"><SubType>Code</SubType><DependentUpon>Form1.cs</DependentUpon></Compile>
+    <!-- Visual Studio may create this empty sidecar for the partial code-behind;
+         the actual form resources remain in Form1.resx. -->
+    <EmbeddedResource Remove="Form1.Database.resx" />
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="6.1.1" />
     <PackageReference Include="MQTTnet" Version="4.3.7.1207" />
   </ItemGroup>
 
+  <Target Name="CreateDefaultIni" AfterTargets="Build">
+    <Copy SourceFiles="$(MSBuildProjectDirectory)/system.ini.example" DestinationFiles="$(TargetDir)system.ini" Condition="!Exists('$(TargetDir)system.ini')" />
+    <MakeDir Directories="$(TargetDir)Log" />
+  </Target>
 </Project>

@@ -1,0 +1,5 @@
+{
+  "PowerShell": {"url":"https://github.com/PowerShell/PowerShell/releases/download/v7.6.6/PowerShell-7.6.6-win-x64.zip","sha256":"02fe458be20493fbdf43f61ea20610b811ee6c738ab1676c61b9cfcd1a33c860"},
+  "Erlang": {"url":"https://github.com/erlang/otp/releases/download/OTP-27.3.4.18/otp_win64_27.3.4.18.exe","sha256":"22d43e64a316abfbcc760d4a547a85775bc5fdb65d2832bd6d901c6d1b1ee819"},
+  "RabbitMQ": {"url":"https://github.com/rabbitmq/rabbitmq-server/releases/download/v4.3.6/rabbitmq-server-4.3.6.exe","sha256":"0f9ad1d87b8e81d1907a05e3003b154f886b959d01b9c108f9f0f9ea6b4b26b8"}
+}

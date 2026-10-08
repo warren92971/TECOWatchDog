@@ -1,0 +1,14 @@
+; Copy as system.ini next to TESCWatchDog.exe. Loaded automatically at startup.
+; UTF-8. Password is plain text: keep this file private and do not commit it.
+[CDB]
+DSN = "DB18SQL"
+IP = "140.116.234.18"
+Database = "TECO_AVM3_CDB_Warren_v2"
+UID = ""
+PWD = ""
+TableUserName = "dbo"
+Type = "SQLServer"
+IntegratedSecurity = false
+TrustServerCertificate = false
+; Total timeout for one DB connection/query attempt, 1..600 seconds.
+QueryTimeoutSeconds = 10
